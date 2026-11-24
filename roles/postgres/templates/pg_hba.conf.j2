@@ -1,0 +1,13 @@
+{{ ansible_managed | comment }}
+
+{#начинает цикл по нашему списку правил из defaults/main.yml#}
+{% for rule in postgres__hba_rules %}
+{% if rule.type == 'local' %}
+{#подставляет его значения через пробел#}
+{{ rule.type }} {{ rule.database }} {{ rule.user }} {{ rule.method }}
+{% else %}
+{{ rule.type }} {{ rule.database }} {{ rule.user }} {{ rule.address }} {{ rule.method }}
+{% endif %}
+{% endfor %}
+
+{#{{ ... }} - вывести значение, {% ... %} - выполнить например цикл#}

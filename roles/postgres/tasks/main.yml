@@ -1,0 +1,199 @@
+- name: Install PostgreSQL and required packages
+  ansible.builtin.apt:
+    name: "{{ postgres__packages }}"
+    state: present #модуль apt проверяет наличие пакетов и если они уже установлены, задача возвращает ok
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create /data directory
+  ansible.builtin.file: #модуль управления файлами
+    path: /data
+    state: directory 
+    owner: root
+    group: root
+    mode: "0755" #для владельца 7 = 4+2+1, группа и остальные  5 = 4+1, то есть обычный пользователь может просматривать /data, но не может создавать там папки
+    #4 - читать список содержимого
+    #2 - создавать и удалять элементы
+    #1 - проходить через каталог и обращаться к его содержимому
+
+- name: Create PostgreSQL parent directory
+  ansible.builtin.file:
+    path: /data/postgres
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Create PostgreSQL data directory
+  ansible.builtin.file:
+    path: "{{ postgres__data_dir }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+
+- name: Init database cluster
+  ansible.builtin.command:
+    cmd: "/usr/lib/postgresql/{{ __pg_version }}/bin/pg_ctl initdb -D {{ postgres__data_dir }}"
+    creates: "{{ postgres__data_dir }}/PG_VERSION" #если файл PG_VERSION существует, то команда не будет выполняться
+  become_user: postgres
+
+- name: Edit postgresql.conf
+  ansible.builtin.lineinfile:
+    path: "{{ postgres__data_dir }}/postgresql.conf"
+    regexp: "^#?{{ item.key | regex_escape() }}\\s*="
+    line: "{{ item.key }} = {{ item.value }}"
+    create: false
+  loop: "{{ postgres__opts | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  notify: Restart PostgreSQL 
+
+- name: Configure pg_hba.conf
+  ansible.builtin.template:
+    src: pg_hba.conf.j2 # шаблон для конфигурации pg_hba.conf, .j2 это шаблон Jinja2. откуда записываем
+    dest: "{{ postgres__data_dir }}/pg_hba.conf" #куда записываем
+    owner: postgres
+    group: postgres
+    mode: "0600"
+  notify: Restart PostgreSQL
+
+- name: Stop and disable default PostgreSQL service
+  ansible.builtin.systemd_service:
+    name: "postgresql@{{ __pg_version }}-main" #имя службы, которой управляет модуль systemd_service
+    state: stopped
+    enabled: false
+
+
+- name: Disable automatic startup of default cluster
+  ansible.builtin.lineinfile:
+    path: "/etc/postgresql/{{ __pg_version }}/main/start.conf" #путь к файлу управления запуском стандартного кластера
+    regexp: "^(auto|manual|disabled)$" #ищем строку, которая содержит один из этих режимов
+    line: manual #найденную строку заменяем на manual
+    create: false
+  notify: Reload systemd
+
+- name: Create PostgreSQL systemd service
+  ansible.builtin.template:
+    src: postgres.service.j2
+    dest: /etc/systemd/system/postgres.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: 
+    - Reload systemd
+    - Restart PostgreSQL
+
+
+- name: Apply systemd changes before starting PostgreSQL
+  ansible.builtin.meta: flush_handlers #Для принудительного запуска хендлеров. Проверка должна выполняться и после отката конфигурации
+
+- name: Start and enable PostgreSQL service
+  ansible.builtin.systemd_service:
+    name: postgres.service
+    state: started
+    enabled: true
+
+- name: Check PostgreSQL with SELECT 1
+  ansible.builtin.command:
+    cmd: psql -d postgres -c 'SELECT 1;'
+  become_user: postgres
+  changed_when: false #не отмечает эту задачу как изменившую систему. Эта строка влияет только на отметку changed, ошибки она не скрывает
+
+- name: Create Databases
+  community.postgresql.postgresql_db:
+    name: "{{ item.name }}"
+    encoding: "{{ item.encoding | default(omit) }}" #Вместо дублирования значений по умолчанию используем omit. Если значение равно omit, параметр игнорируется
+    #Полей encoding и state мы не указали, поэтому default(omit) исключит эти параметры из вызова модуля. По умолчанию модуль обеспечивает наличие базы и создаст её, если её ещё нет
+    state: "{{ item.state | default(omit) }}"
+  loop: "{{ postgres__databases }}"
+  become_user: postgres
+
+- name: Create PostgreSQL users
+  community.postgresql.postgresql_user:
+    name: "{{ item.name }}"
+    password: "{{ item.password | default(omit) }}" #если пароль не указан, omit исключает параметр из вызова модуля и модуль создаст пользователя без пароля
+    role_attr_flags: "{{ item.role_attr_flags | default(omit) }}" #если роль не указана, omit исключит параметр из вызова модуля и модуль создаст пользователя без ролей
+    state: "{{ item.state | default('present') }}" #означает, чтопользователь должен существовать
+  loop: "{{ postgres__users }}"
+  become_user: postgres
+  no_log: true #скрывает вывод задачи, чтобы пароль не оказался в отчёте
+
+- name: Grant PostgreSQL role memberships #включим права для мониторинга для пользователя postgres_exporter, чтобы он мог получать статистику из PostgreSQL
+  community.postgresql.postgresql_membership: #модуль управления членством в ролях PostgreSQL
+    groups: "{{ item.groups }}"
+    target_roles:
+      - "{{ item.name }}"
+    state: present 
+  loop: "{{ postgres__users }}"
+  when:
+    - item.groups is defined
+    - (item.state | default('present')) == 'present'
+  become_user: postgres
+  no_log: true 
+
+- name: Prepare PostgreSQL Exporter on controller
+  delegate_to: localhost
+  become: false
+  run_once: true
+  block: #объединяет первые две задачи, они выполняются на контроллере без sudo
+    - name: Create exporter download directory
+      ansible.builtin.file:
+        path: /tmp/postgres-exporter
+        state: directory
+        mode: "0755"
+
+    - name: Download and extract PostgreSQL Exporter
+      ansible.builtin.unarchive:
+        src: "https://github.com/prometheus-community/postgres_exporter/releases/download/v{{ postgres__exporter_version }}/{{ __postgres_exporter_archive }}.tar.gz"
+        dest: /tmp/postgres-exporter
+        remote_src: true #обрабатывать на той машине, где выполняется задача
+        creates: "/tmp/postgres-exporter/{{ __postgres_exporter_archive }}/postgres_exporter" #позволяет пропустить этот шаг, когда бинарник уже распакован
+
+- name: Install PostgreSQL Exporter binary
+  ansible.builtin.copy:
+    src: "/tmp/postgres-exporter/{{ __postgres_exporter_archive }}/postgres_exporter"
+    dest: /usr/local/bin/postgres_exporter
+    owner: root
+    group: root
+    mode: "0755"
+  notify: Restart PostgreSQL Exporter
+
+
+- name: Create PostgreSQL Exporter system user
+  ansible.builtin.user:
+    name: postgres_exporter
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Configure PostgreSQL Exporter connection
+  ansible.builtin.template:
+    src: postgres_exporter.env.j2
+    dest: /etc/postgres_exporter.env
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  diff: false
+  notify: Restart PostgreSQL Exporter
+
+- name: Create PostgreSQL Exporter systemd service
+  ansible.builtin.template:
+    src: postgres_exporter.service.j2
+    dest: /etc/systemd/system/postgres_exporter.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart PostgreSQL Exporter
+
+- name: Apply exporter service changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start and enable PostgreSQL Exporter
+  ansible.builtin.systemd_service:
+    name: postgres_exporter.service
+    state: started
+    enabled: true
